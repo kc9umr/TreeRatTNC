@@ -1,0 +1,135 @@
+
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+#define UART Serial2
+
+// ===== APRS BLE KISS UUIDs (per spec) =====
+#define KTS_SERVICE_UUID "00000001-ba2a-46c9-ae49-01b0961f68bb"
+#define KTS_TX_CHAR_UUID "00000002-ba2a-46c9-ae49-01b0961f68bb" // Write (host -> TNC)
+#define KTS_RX_CHAR_UUID "00000003-ba2a-46c9-ae49-01b0961f68bb" // Notify (TNC -> host)
+
+// ===== Globals =====
+BLECharacteristic *rxChar;
+bool clientSubscribed = false;
+bool testInjected = false;
+
+// ===== CRC (AX.25) =====
+uint16_t crc_ccitt(const uint8_t *buf, int len) {
+  uint16_t crc = 0xFFFF;
+  for (int i = 0; i < len; i++) {
+    crc ^= buf[i];
+    for (int j = 0; j < 8; j++)
+      crc = (crc & 1) ? (crc >> 1) ^ 0x8408 : crc >> 1;
+  }
+  return ~crc;
+}
+
+// ===== AX.25 Callsign Encoder =====
+void encodeCall(uint8_t *dst, const char *call, uint8_t ssid, bool last) {
+  for (int i = 0; i < 6; i++)
+    dst[i] = (i < strlen(call) ? call[i] : ' ') << 1;
+  dst[6] = ((ssid & 0x0F) << 1) | (last ? 1 : 0);
+}
+
+// ===== Build ONE valid KISS+AX.25 frame =====
+int buildTestFrame(uint8_t *out) {
+  uint8_t ax[128];
+  int idx = 0;
+
+  encodeCall(&ax[idx], "KC9UMR", 9, false); idx += 7; // DEST
+  encodeCall(&ax[idx], "N0CALL", 9, true);  idx += 7; // SRC
+
+  ax[idx++] = 0x03; // UI
+  ax[idx++] = 0xF0; // No L3
+
+  const char *msg = ":KC9UMR-9 :it works";
+  while (*msg) ax[idx++] = *msg++;
+
+  uint16_t crc = crc_ccitt(ax, idx);
+  ax[idx++] = crc & 0xFF;
+  ax[idx++] = crc >> 8;
+
+  // ---- KISS framing ----
+  int k = 0;
+  out[k++] = 0xC0;
+  out[k++] = 0x00;
+
+  for (int i = 0; i < idx; i++) {
+    if (ax[i] == 0xC0) { out[k++] = 0xDB; out[k++] = 0xDC; }
+    else if (ax[i] == 0xDB) { out[k++] = 0xDB; out[k++] = 0xDD; }
+    else out[k++] = ax[i];
+  }
+
+  out[k++] = 0xC0;
+  return k;
+}
+
+// ===== TX (host -> TNC) =====
+// TX (host -> TNC) callback
+class TXCallback : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    String val = c->getValue();          // Arduino String, safe
+    if (val.length() > 0) {
+      UART.write((const uint8_t*)val.c_str(), val.length());
+    }
+  }
+};
+
+
+// ===== CCCD monitor (real subscribe detection) =====
+class CCCDCallback : public BLEDescriptorCallbacks {
+  void onWrite(BLEDescriptor *d) override {
+    uint8_t *v = d->getValue();
+    if (v && d->getLength() >= 2 && v[0] == 0x01) {
+      clientSubscribed = true;
+      Serial.println("BLE subscribed");
+    }
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+  UART.begin(115200);
+
+  BLEDevice::init("TreeRatTNC");
+  BLEServer *srv = BLEDevice::createServer();
+  BLEService *svc = srv->createService(KTS_SERVICE_UUID);
+
+  // RX (notify)
+  rxChar = svc->createCharacteristic(
+    KTS_RX_CHAR_UUID,
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+
+  BLE2902 *cccd = new BLE2902();
+  cccd->setCallbacks(new CCCDCallback());
+  rxChar->addDescriptor(cccd);
+
+  // TX (write)
+  BLECharacteristic *txChar = svc->createCharacteristic(
+    KTS_TX_CHAR_UUID,
+    BLECharacteristic::PROPERTY_WRITE
+  );
+  txChar->setCallbacks(new TXCallback());
+
+  svc->start();
+  srv->getAdvertising()->start();
+
+  Serial.println("TreeRatTNC BLE ready");
+}
+
+void loop() {
+  if (clientSubscribed && !testInjected) {
+    uint8_t frame[256];
+    int len = buildTestFrame(frame);
+    rxChar->setValue(frame, len);
+    rxChar->notify();
+    testInjected = true;
+    Serial.println("Injected sanity test frame");
+  }
+  delay(100);
+}
