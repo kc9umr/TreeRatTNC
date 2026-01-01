@@ -1,0 +1,142 @@
+/*
+ * TreeRatTNC Phase 1
+ * RA4M1 / Arduino UNO R4 WiFi
+ *
+ * Role: Minimal UART transport to ESP32
+ * - TIPP-lite framed protocol
+ * - DATA echo
+ * - Heartbeat every 1s (debug-friendly)
+ */
+
+#include <Arduino.h>
+
+// ---------- UART ----------
+#define ESP Serial2
+#define ESP_BAUD 115200
+
+// ---------- TIPP-lite framing ----------
+#define SOF 0x7E
+#define EOF 0x7F
+
+enum FrameType : uint8_t {
+  TYPE_DATA = 0x01,
+  TYPE_HEARTBEAT = 0x10
+};
+
+// RX state machine
+enum RXState { WAIT_SOF, READ_TYPE, READ_LEN, READ_PAYLOAD, READ_CRC1, READ_CRC2, WAIT_EOF };
+RXState state = WAIT_SOF;
+
+uint8_t rxType = 0;
+uint8_t rxLen = 0;
+uint8_t rxIdx = 0;
+uint8_t payload[255];
+uint16_t rxCrc;
+
+// ---------- CRC16-CCITT ----------
+uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
+  uint16_t crc = 0xFFFF;
+  while (len--) {
+    crc ^= *data++;
+    for (int i = 0; i < 8; i++)
+      crc = (crc & 1) ? (crc >> 1) ^ 0x8408 : crc >> 1;
+  }
+  return crc;
+}
+
+// ---------- Send frame ----------
+void sendFrame(FrameType type, const uint8_t *payload, uint8_t len) {
+  ESP.write(SOF);
+  ESP.write(type);
+  ESP.write(len);
+  if (len > 0) ESP.write(payload, len);
+
+  // CRC over type + len + payload
+  uint8_t crcbuf[257];
+  crcbuf[0] = type;
+  crcbuf[1] = len;
+  if (len > 0) memcpy(&crcbuf[2], payload, len);
+  uint16_t crc = crc16_ccitt(crcbuf, len + 2);
+
+  ESP.write(crc & 0xFF);
+  ESP.write(crc >> 8);
+  ESP.write(EOF);
+}
+
+// ---------- Process incoming byte ----------
+void processByte(uint8_t b) {
+  static uint8_t crcbuf[257];
+
+  switch (state) {
+    case WAIT_SOF:
+      if (b == SOF) state = READ_TYPE;
+      break;
+
+    case READ_TYPE:
+      rxType = b;
+      state = READ_LEN;
+      break;
+
+    case READ_LEN:
+      rxLen = b;
+      rxIdx = 0;
+      state = (rxLen == 0) ? READ_CRC1 : READ_PAYLOAD;
+      break;
+
+    case READ_PAYLOAD:
+      payload[rxIdx++] = b;
+      if (rxIdx >= rxLen) state = READ_CRC1;
+      break;
+
+    case READ_CRC1:
+      rxCrc = b;
+      state = READ_CRC2;
+      break;
+
+    case READ_CRC2:
+      rxCrc |= (uint16_t)b << 8;
+      state = WAIT_EOF;
+      break;
+
+    case WAIT_EOF:
+      if (b == EOF) {
+        crcbuf[0] = rxType;
+        crcbuf[1] = rxLen;
+        if (rxLen > 0) memcpy(&crcbuf[2], payload, rxLen);
+
+        uint16_t calc = crc16_ccitt(crcbuf, rxLen + 2);
+        if (calc == rxCrc) {
+          // Phase-1: echo DATA frames only
+          if (rxType == TYPE_DATA) {
+            sendFrame(TYPE_DATA, payload, rxLen);
+          }
+        }
+      }
+      state = WAIT_SOF;
+      break;
+  }
+}
+
+// ---------- Setup ----------
+unsigned long lastHb = 0;
+
+void setup() {
+  Serial.begin(115200);   // USB debug
+  ESP.begin(ESP_BAUD);    // UART to ESP32
+  Serial.println("TreeRatTNC Phase-1 RA4M1 booted");
+}
+
+// ---------- Loop ----------
+void loop() {
+  // Process UART from ESP32
+  while (ESP.available()) {
+    processByte(ESP.read());
+  }
+
+  // Heartbeat every 1 second
+  if (millis() - lastHb > 1000) {
+    lastHb = millis();
+    uint8_t hb = 0xAA;  // debug-friendly payload
+    sendFrame(TYPE_HEARTBEAT, &hb, 1);
+  }
+}
