@@ -1,0 +1,148 @@
+/*
+ * TreeRatTNC Phase-2 ESP32 BLE-KISS
+ *
+ * BLE-KISS UUIDs (aprs.fi spec):
+ *   Service: 00000001-ba2a-46c9-ae49-01b0961f68bb
+ *   RX Char (TNC -> App): 00000003-ba2a-46c9-ae49-01b0961f68bb (Notify + Read)
+ *   TX Char (App -> TNC): 00000002-ba2a-46c9-ae49-01b0961f68bb (Write)
+ *
+ * Features:
+ *   - BLE advertising with correct service UUID
+ *   - TX -> UART forwarding
+ *   - UART -> RX notify with subscription check
+ *   - Heartbeat every second (0xAA) only if subscribed
+ */
+
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// ---------------- Config ----------------
+#define UART_BAUD 115200
+#define UART Serial2
+
+bool clientSubscribed = false;
+
+// ---------------- BLE Callbacks ----------------
+
+// TX Characteristic (App -> ESP32)
+class TXCallback : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pCharacteristic) override {
+    String val = pCharacteristic->getValue();  // Arduino String
+    if (val.length() > 0) {
+      // Forward to UART
+      UART.write((const uint8_t*)val.c_str(), val.length());
+
+      // Debug
+      Serial.print("TX -> UART: ");
+      for (size_t i = 0; i < val.length(); i++) {
+        Serial.print((uint8_t)val[i], HEX);
+        Serial.print(" ");
+      }
+      Serial.println();
+    }
+  }
+};
+
+// RX Descriptor (CCCD) callback for subscription
+class RXDescriptorCB : public BLEDescriptorCallbacks {
+  void onWrite(BLEDescriptor* pDescriptor) override {
+    uint8_t* val = pDescriptor->getValue();
+    if (val != nullptr && pDescriptor->getLength() > 0 && val[0] == 0x01) {
+      clientSubscribed = true;
+      Serial.println("Client subscribed to RX notifications");
+    } else {
+      clientSubscribed = false;
+      Serial.println("Client unsubscribed from RX notifications");
+    }
+  }
+};
+
+// Server connection callbacks
+class ServerCB : public BLEServerCallbacks {
+  void onConnect(BLEServer* srv) override {
+    Serial.println("BLE client connected");
+  }
+  void onDisconnect(BLEServer* srv) override {
+    Serial.println("BLE client disconnected");
+    clientSubscribed = false;
+  }
+};
+
+// ---------------- Setup ----------------
+BLECharacteristic* rxChar;
+BLECharacteristic* txChar;
+
+void setup() {
+  Serial.begin(115200);
+  UART.begin(UART_BAUD);
+
+  Serial.println("TreeRatTNC Phase-2 BLE-KISS starting...");
+
+  BLEDevice::init("TreeRatTNC");
+  BLEServer* srv = BLEDevice::createServer();
+  srv->setCallbacks(new ServerCB());
+
+  // BLE-KISS service
+  BLEService* svc = srv->createService("00000001-ba2a-46c9-ae49-01b0961f68bb");
+
+  // RX Characteristic: Notify + Read
+  rxChar = svc->createCharacteristic(
+    "00000003-ba2a-46c9-ae49-01b0961f68bb",
+    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
+  );
+
+  // RX Descriptor (CCCD)
+  BLEDescriptor* rxDesc = new BLE2902();
+  rxDesc->setCallbacks(new RXDescriptorCB());
+  rxChar->addDescriptor(rxDesc);
+
+  // TX Characteristic: Write
+  txChar = svc->createCharacteristic(
+    "00000002-ba2a-46c9-ae49-01b0961f68bb",
+    BLECharacteristic::PROPERTY_WRITE
+  );
+  txChar->setCallbacks(new TXCallback());
+
+  svc->start();
+
+  // Start advertising service
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(svc->getUUID());
+  adv->start();
+
+  Serial.println("BLE-KISS ready and advertising");
+}
+
+// ---------------- Loop ----------------
+void loop() {
+  static unsigned long lastHb = 0;
+  static uint8_t buf[64];
+
+  // UART -> BLE RX notify
+  while (UART.available()) {
+    int n = UART.readBytes(buf, sizeof(buf));
+    if (n > 0 && clientSubscribed) {
+      rxChar->setValue(buf, n);
+      rxChar->notify();
+
+      Serial.print("UART -> RX notify: ");
+      for (int i = 0; i < n; i++) {
+        Serial.print(buf[i], HEX);
+        Serial.print(" ");
+      }
+      Serial.println();
+    }
+  }
+
+  // Heartbeat every 1 second, only if subscribed
+  if (clientSubscribed && millis() - lastHb > 1000) {
+    lastHb = millis();
+    uint8_t hb = 0xAA;
+    rxChar->setValue(&hb, 1);
+    rxChar->notify();
+    Serial.println("Heartbeat sent: 0xAA");
+  }
+}
