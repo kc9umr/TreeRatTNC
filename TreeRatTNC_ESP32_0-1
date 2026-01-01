@@ -1,0 +1,111 @@
+/*
+ * TreeRatTNC Phase 1 — ESP32
+ * Role: BLE <-> RA4M1 UART transport
+ *
+ * Features:
+ *  - TX characteristic NOTIFY: heartbeats + echoes
+ *  - RX characteristic WRITE: write data → echoed back
+ *  - Heartbeat every 1s (debug payload 0xAA)
+ *  - USB Serial prints connection status
+ */
+
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+#define UART Serial2
+#define UART_BAUD 115200
+
+BLECharacteristic *txChar;
+
+// ---------- BLE Callbacks ----------
+class ServerCB : public BLEServerCallbacks {
+  void onConnect(BLEServer*) override {
+    Serial.println("BLE connected");
+  }
+  void onDisconnect(BLEServer*) override {
+    Serial.println("BLE disconnected");
+  }
+};
+
+class RXCB : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    String v = c->getValue();
+    if (v.length() > 0) {
+      UART.write((const uint8_t*)v.c_str(), v.length());
+      Serial.print("Echoed: ");
+      for (size_t i = 0; i < v.length(); i++) {
+        Serial.print((uint8_t)v[i], HEX);
+        Serial.print(" ");
+      }
+      Serial.println();
+    }
+  }
+};
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(115200);
+  UART.begin(UART_BAUD);
+
+  BLEDevice::init("TreeRatTNC-P1");
+  BLEServer *srv = BLEDevice::createServer();
+  srv->setCallbacks(new ServerCB());
+
+  BLEService *svc = srv->createService("12345678-0000-0000-0000-000000000001");
+
+  // RX (WRITE)
+  BLECharacteristic *rx =
+    svc->createCharacteristic(
+      "12345678-0000-0000-0000-000000000002",
+      BLECharacteristic::PROPERTY_WRITE
+    );
+  rx->setCallbacks(new RXCB());
+
+  // TX (NOTIFY)
+  txChar =
+    svc->createCharacteristic(
+      "12345678-0000-0000-0000-000000000003",
+      BLECharacteristic::PROPERTY_NOTIFY
+    );
+  txChar->addDescriptor(new BLE2902()); // CCCD
+
+  svc->start();
+  srv->getAdvertising()->start();
+
+  Serial.println("TreeRatTNC Phase-1 ESP32 ready");
+}
+
+// ---------- Loop ----------
+void loop() {
+  static unsigned long lastHb = 0;
+  static uint8_t buf[64];
+
+  // Echo from UART to BLE
+  while (UART.available()) {
+    int n = UART.readBytes(buf, sizeof(buf));
+    if (n > 0) {
+      txChar->setValue(buf, n);
+      txChar->notify();
+
+      Serial.print("UART -> BLE: ");
+      for (int i = 0; i < n; i++) {
+        Serial.print(buf[i], HEX);
+        Serial.print(" ");
+      }
+      Serial.println();
+    }
+  }
+
+  // Heartbeat every 1s
+  if (millis() - lastHb > 1000) {
+    lastHb = millis();
+    uint8_t hb = 0xAA; // debug payload
+    txChar->setValue(&hb, 1);
+    txChar->notify();
+
+    Serial.println("Heartbeat sent: 0xAA");
+  }
+}
+
