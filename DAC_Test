@@ -1,0 +1,31 @@
+#include <Arduino.h>
+
+/* ---------------- Bell 202 Parameters ---------------- */
+#define SAMPLE_RATE     9600
+#define MARK_FREQ       1200
+#define DAC_CENTER      2048   // 12-bit DAC midpoint
+#define DAC_AMPLITUDE   1200
+#define DAC_PIN         A0
+
+float phase = 0.0;
+
+void setup() {
+  analogWriteResolution(12);
+  pinMode(DAC_PIN, OUTPUT);
+  Serial.begin(115200);
+  Serial.println("DAC test: continuous 1200 Hz tone on A0");
+}
+
+void loop() {
+  float phaseInc = 2.0 * PI * MARK_FREQ / SAMPLE_RATE;
+
+  phase += phaseInc;
+  if (phase >= 2.0 * PI)
+    phase -= 2.0 * PI;
+
+  int dacVal = DAC_CENTER + (int)(sin(phase) * DAC_AMPLITUDE);
+  analogWrite(DAC_PIN, dacVal);
+
+  // Wait one sample period
+  delayMicroseconds(1000000 / SAMPLE_RATE);
+}
