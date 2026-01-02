@@ -1,0 +1,178 @@
+/*
+ * TreeRatTNC RA4M1 Phase 3
+ * APRS Tracker + KISS TNC (TX only + SmartBeaconing)
+ * 
+ * LED_BUILTIN used directly (no PIN_LED macro)
+ */
+
+#include <Arduino.h>
+#include <TinyGPSPlus.h>
+
+/* ---------------- CONFIG ---------------- */
+
+#define MYCALL     "N0CALL"
+#define MYSSID     9
+#define APRS_PATH  "WIDE1-1,WIDE2-1"
+#define SYMBOL     '>'
+#define SYMBOL_TAB '/'
+
+#define GPS_BAUD   9600
+#define UART_BAUD  115200
+
+#define PIN_PTT    8
+#define PIN_AFSK   9
+
+/* SmartBeaconing */
+#define SB_FAST_RATE   15     // seconds
+#define SB_SLOW_RATE   1800
+#define SB_FAST_SPEED  70.0   // km/h
+#define SB_SLOW_SPEED  5.0
+#define SB_TURN_ANGLE  25.0
+#define SB_TURN_TIME   15
+
+/* ---------------- GLOBALS ---------------- */
+
+TinyGPSPlus gps;
+unsigned long lastBeacon = 0;
+double lastHeading = 0;
+
+/* ---------------- KISS ---------------- */
+
+#define UART_PORT Serial2  // RA4M1 hardware UART for external TNC
+
+void kissSend(uint8_t *buf, size_t len) {
+  // Send KISS frame over UART
+  UART_PORT.write((uint8_t)0xC0);
+  UART_PORT.write((uint8_t)0x00); // KISS Data frame
+  for (size_t i = 0; i < len; i++) {
+    if (buf[i] == 0xC0) {
+      UART_PORT.write((uint8_t)0xDB); UART_PORT.write((uint8_t)0xDC);
+    } else if (buf[i] == 0xDB) {
+      UART_PORT.write((uint8_t)0xDB); UART_PORT.write((uint8_t)0xDD);
+    } else {
+      UART_PORT.write(buf[i]);
+    }
+  }
+  UART_PORT.write((uint8_t)0xC0);
+}
+
+/* ---------------- AX.25 ENCODE ---------------- */
+
+uint16_t crc_ccitt(uint8_t *buf, int len) {
+  uint16_t crc = 0xFFFF;
+  for (int i = 0; i < len; i++) {
+    crc ^= buf[i];
+    for (int j = 0; j < 8; j++)
+      crc = (crc & 1) ? (crc >> 1) ^ 0x8408 : crc >> 1;
+  }
+  return ~crc;
+}
+
+int encodeAX25(uint8_t *out, const char *payload) {
+  uint8_t idx = 0;
+
+  auto addr = [&](const char *call, uint8_t ssid, bool last) {
+    for (int i = 0; i < 6; i++)
+      out[idx++] = (i < strlen(call) ? call[i] : ' ') << 1;
+    out[idx++] = ((ssid & 0x0F) << 1) | (last ? 1 : 0);
+  };
+
+  addr(MYCALL, MYSSID, false);
+  addr("APTRAT", 0, false);
+  addr("WIDE1", 1, false);
+  addr("WIDE2", 1, true);
+
+  out[idx++] = 0x03;
+  out[idx++] = 0xF0;
+
+  while (*payload)
+    out[idx++] = *payload++;
+
+  uint16_t crc = crc_ccitt(out, idx);
+  out[idx++] = crc & 0xFF;
+  out[idx++] = crc >> 8;
+
+  return idx;
+}
+
+/* ---------------- APRS ---------------- */
+
+void buildAndSendPosition() {
+  if (!gps.location.isValid()) return;
+
+  char payload[80];
+  double lat = gps.location.lat();
+  double lon = gps.location.lng();
+  double spd = gps.speed.knots();
+  double crs = gps.course.deg();
+
+  sprintf(payload,
+    "!%02d%05.2f%c%c%03d%05.2f%c%c%03d/%03d",
+    abs((int)lat), fmod(abs(lat)*60, 60),
+    lat >= 0 ? 'N' : 'S',
+    SYMBOL_TAB,
+    abs((int)lon), fmod(abs(lon)*60, 60),
+    lon >= 0 ? 'E' : 'W',
+    SYMBOL,
+    (int)crs, (int)spd
+  );
+
+  uint8_t frame[200];
+  int len = encodeAX25(frame, payload);
+  kissSend(frame, len);
+}
+
+/* ---------------- SMARTBEACON ---------------- */
+
+bool shouldBeacon() {
+  if (!gps.location.isValid()) return false;
+
+  unsigned long now = millis();
+  double speed = gps.speed.kmph();
+  double heading = gps.course.deg();
+
+  unsigned long rate = map(speed, SB_SLOW_SPEED, SB_FAST_SPEED,
+                           SB_SLOW_RATE, SB_FAST_RATE);
+
+  if (now - lastBeacon > rate * 1000) return true;
+
+  if (fabs(heading - lastHeading) > SB_TURN_ANGLE &&
+      now - lastBeacon > SB_TURN_TIME * 1000) {
+    lastHeading = heading;
+    return true;
+  }
+  return false;
+}
+
+/* ---------------- SETUP ---------------- */
+
+void setup() {
+  pinMode(PIN_PTT, OUTPUT);
+  digitalWrite(PIN_PTT, HIGH);
+  pinMode(PIN_AFSK, OUTPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  Serial.begin(115200);
+  Serial1.begin(GPS_BAUD);
+  UART_PORT.begin(UART_BAUD);
+
+  Serial.println("TreeRatTNC RA4M1 Phase 3 boot");
+}
+
+/* ---------------- LOOP ---------------- */
+
+void loop() {
+  while (Serial1.available())
+    gps.encode(Serial1.read());
+
+  // GPS LED blink
+  if (!gps.location.isValid())
+    digitalWrite(LED_BUILTIN, millis() / 1000 % 2);
+  else
+    digitalWrite(LED_BUILTIN, millis() / 200 % 2);
+
+  if (shouldBeacon()) {
+    lastBeacon = millis();
+    buildAndSendPosition();
+  }
+}
