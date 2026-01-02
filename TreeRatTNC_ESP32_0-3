@@ -1,0 +1,100 @@
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// ---------------- BLE UUIDs ----------------
+#define KTS_SERVICE_UUID    "00000001-ba2a-46c9-ae49-01b0961f68bb"
+#define KTS_TX_CHAR_UUID    "00000002-ba2a-46c9-ae49-01b0961f68bb" // write from host
+#define KTS_RX_CHAR_UUID    "00000003-ba2a-46c9-ae49-01b0961f68bb" // notify to host
+
+#define UART Serial2  // ESP32 UART to RA4M1
+
+BLECharacteristic *rxChar;
+BLECharacteristic *txChar;
+
+bool clientSubscribed = false;
+
+// ---------------- Callbacks ----------------
+class TXCallback : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    String val = c->getValue();
+    if (val.length() > 0) {
+      UART.write((const uint8_t*)val.c_str(), val.length());
+    }
+  }
+};
+
+class RXDescriptorCB : public BLEDescriptorCallbacks {
+  void onWrite(BLEDescriptor* d) override {
+    uint8_t* val = d->getValue();
+    if (val && d->getLength() > 0 && val[0] == 0x01) { // notifications enabled
+      clientSubscribed = true;
+    } else {
+      clientSubscribed = false;
+    }
+  }
+};
+
+// ---------------- Test frame ----------------
+const uint8_t testFrame[] = {
+  0xC0, 0x00, 'N','0','C','A','L','L','-','9','>','K','C','9','U','M','R','-','9',':',
+  'i','t',' ','w','o','r','k','s', 0xC0
+};
+bool testInjected = false;
+
+// ---------------- Setup ----------------
+void setup() {
+  Serial.begin(115200);
+  UART.begin(115200);
+
+  BLEDevice::init("TreeRatTNC"); // Peripheral name
+
+  BLEServer *server = BLEDevice::createServer();
+
+  BLEService *svc = server->createService(KTS_SERVICE_UUID);
+
+  txChar = svc->createCharacteristic(
+    KTS_TX_CHAR_UUID,
+    BLECharacteristic::PROPERTY_WRITE
+  );
+  txChar->setCallbacks(new TXCallback());
+
+  rxChar = svc->createCharacteristic(
+    KTS_RX_CHAR_UUID,
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+  rxChar->addDescriptor(new BLE2902());
+  rxChar->getDescriptorByUUID(BLEUUID((uint16_t)0x2902))->setCallbacks(new RXDescriptorCB());
+
+  svc->start();
+
+  // ---- APRS.fi compliant advertising ----
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(KTS_SERVICE_UUID);
+  adv->setScanResponse(true);  // allows full name + service UUID
+  adv->setMinInterval(0x20);   // ~32 * 0.625ms = 20ms interval
+  adv->setMaxInterval(0x40);   // ~40 * 0.625ms = 40ms interval
+  adv->start();
+
+  Serial.println("TreeRatTNC BLE-KISS ready");
+}
+
+// ---------------- Loop ----------------
+void loop() {
+  // Inject test frame once after client subscribes
+  if (!testInjected && clientSubscribed) {
+    rxChar->setValue((uint8_t*)testFrame, sizeof(testFrame));
+    rxChar->notify();
+    testInjected = true;
+    Serial.println("Test frame sent to client");
+  }
+
+  // Forward any UART data to BLE
+  static uint8_t buf[64];
+  int n = UART.readBytes(buf, sizeof(buf));
+  if (n > 0 && clientSubscribed) {
+    rxChar->setValue(buf, n);
+    rxChar->notify();
+  }
+}
