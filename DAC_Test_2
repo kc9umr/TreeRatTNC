@@ -1,0 +1,192 @@
+/*
+ * TreeRatTNC – Phase 4A (Loop-based AFSK TX)
+ * Bell 202 AFSK TX using DAC (UNO R4 / RA4M1)
+ *
+ * NO timer, NO ISR – uses micros() in a tight loop.
+ * TX ONLY – no RX, no BLE, no RF keying yet.
+ */
+
+#include <Arduino.h>
+#include <math.h>
+
+/* ---------------- Bell 202 Parameters ---------------- */
+#define SAMPLE_RATE     9600
+#define BAUD_RATE       1200
+#define MARK_FREQ       1200
+#define SPACE_FREQ      2200
+#define SAMPLES_PER_BIT (SAMPLE_RATE / BAUD_RATE)
+#define DAC_CENTER      2048   // 12-bit DAC midpoint
+#define DAC_AMPLITUDE   150
+#define DAC_PIN         A0     // DAC0 / A0 on Uno R4
+
+/* ---------------- Globals ---------------- */
+
+// Test frame
+const char TEST_PAYLOAD[] = "N0CALL-9>APRS::KC9UMR-9 :it works";
+
+// AX.25 buffer
+uint8_t ax25Buf[400];
+size_t ax25Len = 0;
+
+// NCO / phase accumulator
+float phase = 0.0f;
+float phaseInc = 0.0f;
+
+// Bitstream state
+bool txActive = false;
+size_t bitPos = 0;
+size_t bytePos = 0;
+uint8_t currentByte = 0;
+uint8_t onesCount = 0;
+bool nrziState = true;
+
+/* ---------------- CRC ---------------- */
+uint16_t crc_ccitt(uint8_t *buf, size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= buf[i];
+    for (int j = 0; j < 8; j++)
+      crc = (crc & 1) ? (crc >> 1) ^ 0x8408 : crc >> 1;
+  }
+  return ~crc;
+}
+
+/* ---------------- AX.25 Encode ---------------- */
+size_t buildAX25(uint8_t *out, const char *info) {
+  size_t idx = 0;
+
+  auto addr = [&](const char *call, uint8_t ssid, bool last) {
+    for (int i = 0; i < 6; i++)
+      out[idx++] = ((i < (int)strlen(call)) ? call[i] : ' ') << 1;
+    out[idx++] = ((ssid & 0x0F) << 1) | (last ? 1 : 0);
+  };
+
+  addr("N0CALL", 9, false);
+  addr("APRS",   0, false);
+  addr("KC9UMR", 9, true);
+
+  out[idx++] = 0x03; // UI frame
+  out[idx++] = 0xF0; // no layer 3
+
+  while (*info)
+    out[idx++] = *info++;
+
+  uint16_t crc = crc_ccitt(out, idx);
+  out[idx++] = crc & 0xFF;
+  out[idx++] = crc >> 8;
+
+  return idx;
+}
+
+/* ---------------- Bit Access ---------------- */
+bool getNextBit() {
+  if (bytePos >= ax25Len) {
+    txActive = false;
+    return 0;
+  }
+
+  if (bitPos == 0)
+    currentByte = ax25Buf[bytePos];
+
+  bool bit = currentByte & 0x01;
+  currentByte >>= 1;
+  bitPos++;
+
+  if (bitPos == 8) {
+    bitPos = 0;
+    bytePos++;
+  }
+
+  return bit;
+}
+
+/* ---------------- AFSK TX (blocking) ---------------- */
+
+void sendAFSKFrame() {
+  // Build AX.25 frame into ax25Buf
+  ax25Len = buildAX25(ax25Buf, TEST_PAYLOAD);
+
+  // Reset bitstream state
+  bitPos = 0;
+  bytePos = 0;
+  onesCount = 0;
+  nrziState = true;
+  txActive = true;
+
+  phase = 0.0f;
+  phaseInc = 0.0f;
+
+  const unsigned long samplePeriodUs = 1000000UL / SAMPLE_RATE;
+  unsigned long nextSample = micros();
+
+  int sampleInBit = 0;
+
+  // Blocking: generate samples until txActive goes false
+  while (txActive) {
+    unsigned long now = micros();
+    // wait for next sample slot
+    if ((long)(now - nextSample) < 0) {
+      continue;
+    }
+    nextSample += samplePeriodUs;
+
+    // At the start of each bit, fetch next bit and update freq via NRZI
+    if (sampleInBit == 0) {
+      bool bit = getNextBit();
+
+      if (bit)
+        onesCount++;
+      else
+        onesCount = 0;
+
+      // NRZI: toggle on 0, or on stuffed bit after 5 ones
+      if (!bit || onesCount == 6) {
+        nrziState = !nrziState;
+        if (onesCount == 6)
+          onesCount = 0;
+      }
+
+      float freq = nrziState ? MARK_FREQ : SPACE_FREQ;
+      phaseInc = 2.0f * PI * freq / SAMPLE_RATE;
+    }
+
+    // NCO update
+    phase += phaseInc;
+    if (phase >= 2.0f * PI)
+      phase -= 2.0f * PI;
+
+    int dacVal = DAC_CENTER + (int)(sin(phase) * DAC_AMPLITUDE);
+    analogWrite(DAC_PIN, dacVal);
+
+    sampleInBit++;
+    if (sampleInBit >= SAMPLES_PER_BIT)
+      sampleInBit = 0;
+  }
+
+  // Return DAC to center (silence)
+  analogWrite(DAC_PIN, DAC_CENTER);
+}
+
+/* ---------------- Setup ---------------- */
+void setup() {
+  analogWriteResolution(12);
+  Serial.begin(115200);
+  Serial.println("TreeRatTNC Phase 4A – loop-based Bell 202 TX");
+
+  // Optionally write center level so you see DC on A0 when idle
+  analogWrite(DAC_PIN, DAC_CENTER);
+}
+
+/* ---------------- Loop ---------------- */
+unsigned long lastTX = 0;
+
+void loop() {
+  unsigned long now = millis();
+  if (now - lastTX > 10000) {
+    lastTX = now;
+    Serial.println("TX test frame (AFSK)");
+    sendAFSKFrame();  // blocking for ~0.5–1s while frame is sent
+  }
+
+  // idle here between beacons
+}
